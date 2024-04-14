@@ -32,28 +32,53 @@
 - name: Check if Kubernetes has already been initialized.
   stat:
     path: /etc/kubernetes/admin.conf
+  when: kubernetes_role == 'control_plane'
   register: kubernetes_init_stat
 
-# Set up control plane.
-- include_tasks: control-plane-setup.yml
+- name: Check if node has already joined a cluster.
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  when: kubernetes_role == 'node'
+  register: kubernetes_join_stat
+
+- name: Select control node to init cluster
+  run_once: true
+  set_fact:
+    init_node: "{{ inventory_hostname }}"
+  delegate_to: "{{ item }}"
+  with_items: "{{ play_hosts }}"
   when: kubernetes_role == 'control_plane'
+
+# Init the cluster.
+- include_tasks: init-cluster.yml
+  when: inventory_hostname == init_node and not kubernetes_init_stat.stat.exists
 
 # Set up nodes.
 - name: Get the kubeadm join command from the Kubernetes control plane.
   command: kubeadm token create --print-join-command
   changed_when: false
-  when: kubernetes_role == 'control_plane'
+  run_once: true
+  when: (kubernetes_role == 'control_plane' and not kubernetes_init_stat.stat.exists) or (kubernetes_role == 'node' and not kubernetes_join_stat.stat.exists)
   register: kubernetes_join_command_result
+  until: kubernetes_join_command_result is not failed
+  delegate_to: "{{ init_node }}"
+  delegate_facts: true
+  retries: 12
+  delay: 5
 
 - name: Set the kubeadm join command globally.
   set_fact:
     kubernetes_join_command: >
       {{ kubernetes_join_command_result.stdout }}
       {{ kubernetes_join_command_extra_opts }}
-  when: kubernetes_join_command_result.stdout is defined
+  when: kubernetes_join_command_result.stdout is defined and inventory_hostname == init_node
   delegate_to: "{{ item }}"
   delegate_facts: true
   with_items: "{{ groups['all'] }}"
 
+# Set up control plane.
+- include_tasks: control-plane-setup.yml
+  when: kubernetes_role == 'control_plane' and not kubernetes_init_stat.stat.exists
+
 - include_tasks: node-setup.yml
-  when: kubernetes_role == 'node'
+  when: kubernetes_role == 'node' and not kubernetes_join_stat.stat.exists
